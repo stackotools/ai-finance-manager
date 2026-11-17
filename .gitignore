@@ -1,11 +1,38 @@
+# Dependencies
 node_modules/
+*/node_modules/
+package-lock.json.bak
+
+# Environment variables & secrets (CRITICAL FOR DEPLOYMENT)
 .env
+.env.*
+*.env
 *.env.local
+server/.env
+server/.env.*
+client/.env
+client/.env.*
+client/.env.local
+!client/.env.example
+!server/.env.example
+*.pem
+*.key
+*.cert
+
+# Production builds
 dist/
 build/
+client/dist/
+
+# OS and Editor files
 .DS_Store
 Thumbs.db
-coverage/
-*.log
 .vscode/
 .idea/
+
+# Testing & Logs
+coverage/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

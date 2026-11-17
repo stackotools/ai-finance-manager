@@ -18,42 +18,91 @@ const auth = require('./middleware/auth');
 
 const app = express();
 
-// Security middleware
+// Trust reverse proxy (Essential for Render, Heroku, etc. when behind load balancers/Cloudflare)
+app.set('trust proxy', 1);
+
+// Security headers with Helmet
 app.use(helmet());
-const allowedOrigins = [env.CLIENT_URL, 'http://localhost:5173', 'http://127.0.0.1:5173'].filter(Boolean);
+
+// Clean and normalize allowed origins for CORS
+const rawClientUrl = (env.CLIENT_URL || '').trim().replace(/\/$/, '');
+const allowedOrigins = [rawClientUrl, 'http://localhost:5173', 'http://127.0.0.1:5173'].filter(Boolean);
+
 app.use(cors({
   origin: (origin, callback) => {
-    if (!origin || allowedOrigins.includes(origin) || origin.startsWith('http://localhost:') || origin.startsWith('http://127.0.0.1:')) {
+    if (!origin) return callback(null, true);
+    const cleanOrigin = origin.trim().replace(/\/$/, '');
+    if (
+      allowedOrigins.includes(cleanOrigin) ||
+      cleanOrigin.startsWith('http://localhost:') ||
+      cleanOrigin.startsWith('http://127.0.0.1:') ||
+      cleanOrigin.endsWith('.onrender.com') ||
+      cleanOrigin.endsWith('.vercel.app')
+    ) {
       return callback(null, true);
     }
-    return callback(new Error('Not allowed by CORS'));
+    return callback(new Error(`Not allowed by CORS: ${origin}`));
   },
   credentials: true
 }));
+
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-// Rate limiting for auth routes
+// --- RATE LIMITERS ---
+// 1. Global API rate limiter (300 requests per 15 min per IP)
+const globalApiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many requests from this IP. Please try again after 15 minutes.' }
+});
+
+// 2. Strict auth rate limiter to prevent brute force (20 attempts per 15 min per IP)
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 20,
-  message: { success: false, message: 'Too many requests, please try again after 15 minutes' }
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many authentication attempts. Please try again after 15 minutes.' }
 });
 
-// Health check
+// 3. AI & Chat rate limiter to protect Gemini / Claude API quotas (40 requests per 15 min)
+const aiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 40,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'AI request limit reached. Please wait a few minutes before sending more queries.' }
+});
+
+// 4. File upload rate limiter for statement parsing (20 uploads per 15 min)
+const uploadLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Upload limit reached. Please wait a few minutes before uploading more statements.' }
+});
+
+// Apply global rate limiting to all /api routes
+app.use('/api', globalApiLimiter);
+
+// Health check endpoint (for Render / uptime monitoring)
 app.get('/api/health', (req, res) => {
-  res.status(200).json({ success: true, message: 'Server is healthy' });
+  res.status(200).json({ success: true, message: 'Server is healthy', timestamp: new Date().toISOString() });
 });
 
 // Routes
 app.use('/api/auth', authLimiter, authRoutes);
 app.use('/api/transactions', auth, transactionRoutes);
 app.use('/api/categories', auth, categoryRoutes);
-app.use('/api/upload', auth, uploadRoutes);
+app.use('/api/upload', auth, uploadLimiter, uploadRoutes);
 app.use('/api/analytics', auth, analyticsRoutes);
-app.use('/api/insights', auth, insightsRoutes);
+app.use('/api/insights', auth, aiLimiter, insightsRoutes);
 app.use('/api/budgets', auth, budgetRoutes);
-app.use('/api/chat', auth, chatRoutes);
+app.use('/api/chat', auth, aiLimiter, chatRoutes);
 
 // 404 handler
 app.use((req, res) => {
