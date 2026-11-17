@@ -1,4 +1,6 @@
 const express = require('express');
+const path = require('path');
+const fs = require('fs');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
@@ -104,7 +106,24 @@ app.use('/api/insights', auth, aiLimiter, insightsRoutes);
 app.use('/api/budgets', auth, budgetRoutes);
 app.use('/api/chat', auth, aiLimiter, chatRoutes);
 
-// 404 handler
+// Serve frontend static build if it exists (for unified frontend+backend deployment)
+const clientDist = path.resolve(__dirname, '../../client/dist');
+if (fs.existsSync(clientDist)) {
+  app.use(express.static(clientDist));
+  app.get('*', (req, res, next) => {
+    if (req.originalUrl.startsWith('/api')) {
+      return next();
+    }
+    res.sendFile(path.join(clientDist, 'index.html'));
+  });
+}
+
+// 404 handler for API routes
+app.use('/api', (req, res) => {
+  res.status(404).json({ success: false, message: 'API route not found' });
+});
+
+// Fallback 404 handler
 app.use((req, res) => {
   res.status(404).json({ success: false, message: 'Route not found' });
 });
