@@ -35,6 +35,117 @@ function parseExcel(buffer) {
 }
 
 /**
+ * Parse PhonePe, Google Pay, and other UPI PDF statement formats
+ */
+function parsePhonePeOrUPI(text) {
+  const rows = [];
+  const datePattern = /(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*,?\s+\d{4}|\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}/i;
+
+  const rawLines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+
+  const lines = rawLines.filter(l => 
+    !/^Transaction Statement for|^Date\s+Transaction Details|^\d{1,2}\s+[A-Za-z]+,?\s+\d{4}\s*-\s*\d{1,2}\s+[A-Za-z]+,?\s+\d{4}|^Page\s+\d+|^Total\s+Spend|^Total\s+Received/i.test(l)
+  );
+
+  // Strategy A: Single-line / horizontal layout
+  const horizontalRegex = /^((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*,?\s+\d{4})(?:\s+\d{1,2}:\d{2}\s*(?:am|pm))?\s+(.*?)\s+(DEBIT|CREDIT)\s+[₹$]?\s*([\d,]+(?:\.\d{1,2})?)$/i;
+
+  for (const line of lines) {
+    const hMatch = line.match(horizontalRegex);
+    if (hMatch) {
+      let desc = hMatch[2].trim().replace(/\s*(?:Transaction ID|UTR No\.|Paid by|Credited to).*$/i, '').trim();
+      const type = hMatch[3].toUpperCase();
+      const amountStr = hMatch[4].replace(/,/g, '');
+      const debitStr = type === 'DEBIT' ? amountStr : '';
+      const creditStr = type === 'CREDIT' ? amountStr : '';
+      rows.push([hMatch[1], desc || 'UPI Transaction', debitStr, creditStr, '']);
+    }
+  }
+
+  if (rows.length > 0) return rows;
+
+  // Strategy B: Multi-line / block layout (PhonePe standard format)
+  let currentTx = null;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const isDate = datePattern.test(line);
+
+    if (isDate) {
+      if (currentTx && currentTx.date && currentTx.amount) {
+        const debitStr = currentTx.type === 'DEBIT' ? String(currentTx.amount) : (currentTx.type === 'CREDIT' ? '' : (currentTx.isCredit ? '' : String(currentTx.amount)));
+        const creditStr = currentTx.type === 'CREDIT' ? String(currentTx.amount) : (currentTx.type === 'DEBIT' ? '' : (currentTx.isCredit ? String(currentTx.amount) : ''));
+        const desc = currentTx.details.join(' ').trim() || 'UPI Transaction';
+        rows.push([currentTx.date, desc, debitStr, creditStr, '']);
+      }
+      const dMatch = line.match(datePattern);
+      currentTx = {
+        date: dMatch[0],
+        details: [],
+        type: '',
+        isCredit: false,
+        amount: null
+      };
+      continue;
+    }
+
+    if (!currentTx) continue;
+
+    // Time line (e.g. "12:00 am" or "09:58 pm")
+    if (/^\d{1,2}:\d{2}\s*(?:am|pm)$/i.test(line)) {
+      continue;
+    }
+
+    // Type line
+    if (/^(DEBIT|DR|DEBITED)$/i.test(line)) {
+      currentTx.type = 'DEBIT';
+      currentTx.isCredit = false;
+      continue;
+    }
+    if (/^(CREDIT|CR|CREDITED)$/i.test(line)) {
+      currentTx.type = 'CREDIT';
+      currentTx.isCredit = true;
+      continue;
+    }
+
+    // Amount line (e.g. "₹249" or "20" or "₹160.00")
+    const amtMatch = line.match(/^[-+]?[₹$]?\s*([\d,]+(?:\.\d{1,2})?)$/);
+    if (amtMatch && !currentTx.amount) {
+      if (!/^X{2,}/i.test(line) && !line.includes('UTR') && !/^\d{10,}$/.test(line)) {
+        currentTx.amount = parseFloat(amtMatch[1].replace(/,/g, ''));
+        continue;
+      }
+    }
+
+    // Metadata lines to skip
+    if (/^(Transaction ID|UTR No\.|Paid by|Credited to|Transfer to Account|Wallet)/i.test(line)) {
+      continue;
+    }
+
+    // Hint for Credit / Debit based on text
+    if (/^Received from/i.test(line)) {
+      currentTx.isCredit = true;
+    } else if (/^Paid to|^Transfer to/i.test(line)) {
+      currentTx.isCredit = false;
+    }
+
+    // Description text (capture the clean name, e.g. "Paid to S K AFGHANI BIRIYANI")
+    if (currentTx.details.length < 2) {
+      currentTx.details.push(line);
+    }
+  }
+
+  if (currentTx && currentTx.date && currentTx.amount) {
+    const debitStr = currentTx.type === 'DEBIT' ? String(currentTx.amount) : (currentTx.type === 'CREDIT' ? '' : (currentTx.isCredit ? '' : String(currentTx.amount)));
+    const creditStr = currentTx.type === 'CREDIT' ? String(currentTx.amount) : (currentTx.type === 'DEBIT' ? '' : (currentTx.isCredit ? String(currentTx.amount) : ''));
+    const desc = currentTx.details.join(' ').trim() || 'UPI Transaction';
+    rows.push([currentTx.date, desc, debitStr, creditStr, '']);
+  }
+
+  return rows;
+}
+
+/**
  * Parse text from a PDF bank statement buffer into tabular rows
  */
 async function parsePDF(buffer) {
@@ -53,15 +164,29 @@ async function parsePDF(buffer) {
     throw new Error('PDF appears to be empty or contains scanned images without selectable text.');
   }
 
+  // 1. Try PhonePe / UPI Specialized Parser first
+  const upiRows = parsePhonePeOrUPI(text);
+  if (upiRows && upiRows.length > 0) {
+    const headers = ['Date', 'Description', 'Debit', 'Credit', 'Balance'];
+    return {
+      headers,
+      rows: upiRows,
+      headerRowIndex: 0,
+      columnGuess: { date: 0, description: 1, debit: 2, credit: 3, amount: -1, balance: -1 },
+      totalRows: upiRows.length
+    };
+  }
+
+  // 2. Fallback to Standard Bank Statement Parser
   const rawLines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
 
-  // 1. Filter out non-transaction header/footer lines
+  // Filter out non-transaction header/footer lines
   const filteredLines = rawLines.filter(l => 
     !/^SAMPLE DOCUMENT|^SAMPLE BANK|^Account Name|^Account Type|^Account Number|^Branch:|^IFSC:|^Statement Period:|^Customer ID:|^Currency:|^Date\s+Description|^--\s*\d+\s*of\s*\d+\s*--|^This is a computer-generated|^Page\s+\d+/i.test(l)
   );
 
-  // 2. Stitch continuation lines (lines that do not start with a date belong to previous transaction)
-  const dateStartRegex = /^(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}|\d{4}[\/\-\.]\d{1,2}[\/\-\.]\d{1,2}|\d{1,2}[\s\-\/\.](?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[\s\-\/\.]\d{2,4})\b/i;
+  // Stitch continuation lines (lines that do not start with a date belong to previous transaction)
+  const dateStartRegex = /^(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}|\d{4}[\/\-\.]\d{1,2}[\/\-\.]\d{1,2}|\d{1,2}[\s\-\/\.](?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[\s\-\/\.]\d{2,4}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{2,4})\b/i;
 
   const physicalRows = [];
   for (const l of filteredLines) {
@@ -72,7 +197,7 @@ async function parsePDF(buffer) {
     }
   }
 
-  // 3. Parse each transaction row
+  // Parse each transaction row
   const rows = [];
   for (const line of physicalRows) {
     // Skip summary lines (opening/closing balance, running b/f, totals)
@@ -91,20 +216,20 @@ async function parsePDF(buffer) {
     let credit = '';
     let balance = '';
 
-    // Monetary amounts at the end of the line (e.g., "12,000.00 18,200.00" or "450.00 10,127.00")
-    const trailingThree = rest.match(/^(.*?)\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})$/);
-    const trailingTwo = rest.match(/^(.*?)\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})$/);
-    const trailingOne = rest.match(/^(.*?)\s+([\d,]+\.\d{2})$/);
+    // Monetary amounts at the end of the line (e.g., "12,000.00 18,200.00" or "450.00 10,127.00" or integer "500")
+    const trailingThree = rest.match(/^(.*?)\s+([₹$]?[\d,]+(?:\.\d{1,2})?)\s+([₹$]?[\d,]+(?:\.\d{1,2})?)\s+([₹$]?[\d,]+(?:\.\d{1,2})?)$/);
+    const trailingTwo = rest.match(/^(.*?)\s+([₹$]?[\d,]+(?:\.\d{1,2})?)\s+([₹$]?[\d,]+(?:\.\d{1,2})?)$/);
+    const trailingOne = rest.match(/^(.*?)\s+([₹$]?[\d,]+(?:\.\d{1,2})?)$/);
 
     if (trailingThree) {
       narration = trailingThree[1].trim();
-      debit = trailingThree[2];
-      credit = trailingThree[3];
-      balance = trailingThree[4];
+      debit = trailingThree[2].replace(/[₹$,]/g, '');
+      credit = trailingThree[3].replace(/[₹$,]/g, '');
+      balance = trailingThree[4].replace(/[₹$,]/g, '');
     } else if (trailingTwo) {
       narration = trailingTwo[1].trim();
-      const amountVal = trailingTwo[2];
-      balance = trailingTwo[3];
+      const amountVal = trailingTwo[2].replace(/[₹$,]/g, '');
+      balance = trailingTwo[3].replace(/[₹$,]/g, '');
 
       const isCr = /\b(cr|credit|deposit|dep|refund|interest|salary|scholarship|cashback)\b/i.test(narration);
       if (isCr) {
@@ -114,7 +239,7 @@ async function parsePDF(buffer) {
       }
     } else if (trailingOne) {
       narration = trailingOne[1].trim();
-      const amountVal = trailingOne[2];
+      const amountVal = trailingOne[2].replace(/[₹$,]/g, '');
 
       const isCr = /\b(cr|credit|deposit|dep|refund|interest|salary|scholarship|cashback)\b/i.test(narration);
       if (isCr) {
@@ -123,25 +248,14 @@ async function parsePDF(buffer) {
         debit = amountVal;
       }
     } else {
-      // Fallback: line might have integer amount (e.g. 500)
-      const fallbackTwo = rest.match(/^(.*?)\s+([\d,]+(?:\.\d{1,2})?)\s+([\d,]+(?:\.\d{1,2})?)$/);
-      if (fallbackTwo) {
-        narration = fallbackTwo[1].trim();
-        const amountVal = fallbackTwo[2];
-        balance = fallbackTwo[3];
-        const isCr = /\b(cr|credit|deposit|dep|refund|interest|salary|scholarship|cashback)\b/i.test(narration);
-        if (isCr) credit = amountVal;
-        else debit = amountVal;
-      } else {
-        continue;
-      }
+      continue;
     }
 
     rows.push([rawDate, narration, debit, credit, balance]);
   }
 
   if (rows.length === 0) {
-    throw new Error('Could not find transaction records in this PDF. Please check if it contains a standard bank statement table.');
+    throw new Error('Could not find transaction records in this PDF. Please check if it contains a standard bank or PhonePe/UPI statement table.');
   }
 
   const headers = ['Date', 'Description', 'Debit', 'Credit', 'Balance'];
@@ -256,6 +370,13 @@ function parseDate(value) {
   match = str.match(/^(\d{1,2})[\s\-\/\.]([A-Za-z]{3,9})[\s\-\/\.](\d{2,4})$/);
   if (match) {
     const d = new Date(`${match[1]} ${match[2]} ${match[3].length === 2 ? '20' + match[3] : match[3]}`);
+    if (!isNaN(d.getTime())) return d;
+  }
+
+  // MMM DD, YYYY (e.g. Nov 23, 2026 or November 23, 2026)
+  match = str.match(/^([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{4})/);
+  if (match) {
+    const d = new Date(`${match[1]} ${match[2]}, ${match[3]}`);
     if (!isNaN(d.getTime())) return d;
   }
 
