@@ -40,11 +40,12 @@ function parseExcel(buffer) {
 function parsePhonePeOrUPI(text) {
   const rows = [];
   const datePattern = /(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*,?\s+\d{4}|\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}/i;
+  const timePattern = /^\d{1,2}:\d{2}\s*(?:am|pm)$/i;
 
   const rawLines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
 
   const lines = rawLines.filter(l => 
-    !/^Transaction Statement for|^Date\s+Transaction Details|^\d{1,2}\s+[A-Za-z]+,?\s+\d{4}\s*-\s*\d{1,2}\s+[A-Za-z]+,?\s+\d{4}|^Page\s+\d+|^Total\s+Spend|^Total\s+Received/i.test(l)
+    !/^Transaction Statement for|^Date\s+Transaction Details|^Page\s+\d+|^--\s*\d+\s*of\s*\d+\s*--|^This is a system generated|^Total\s+Spend|^Total\s+Received/i.test(l)
   );
 
   // Strategy A: Single-line / horizontal layout
@@ -64,82 +65,49 @@ function parsePhonePeOrUPI(text) {
 
   if (rows.length > 0) return rows;
 
-  // Strategy B: Multi-line / block layout (PhonePe standard format)
-  let currentTx = null;
+  // Strategy B: PhonePe block layout (Date on line 1, Time line 2, "DEBIT ₹249\tPaid to..." on line 3)
+  let currentDate = null;
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    const isDate = datePattern.test(line);
 
-    if (isDate) {
-      if (currentTx && currentTx.date && currentTx.amount) {
-        const debitStr = currentTx.type === 'DEBIT' ? String(currentTx.amount) : (currentTx.type === 'CREDIT' ? '' : (currentTx.isCredit ? '' : String(currentTx.amount)));
-        const creditStr = currentTx.type === 'CREDIT' ? String(currentTx.amount) : (currentTx.type === 'DEBIT' ? '' : (currentTx.isCredit ? String(currentTx.amount) : ''));
-        const desc = currentTx.details.join(' ').trim() || 'UPI Transaction';
-        rows.push([currentTx.date, desc, debitStr, creditStr, '']);
-      }
+    // Check if line contains a standalone Date
+    if (datePattern.test(line) && !line.includes('DEBIT') && !line.includes('CREDIT') && !line.includes('Paid to') && !line.includes('Received from')) {
       const dMatch = line.match(datePattern);
-      currentTx = {
-        date: dMatch[0],
-        details: [],
-        type: '',
-        isCredit: false,
-        amount: null
-      };
-      continue;
-    }
-
-    if (!currentTx) continue;
-
-    // Time line (e.g. "12:00 am" or "09:58 pm")
-    if (/^\d{1,2}:\d{2}\s*(?:am|pm)$/i.test(line)) {
-      continue;
-    }
-
-    // Type line
-    if (/^(DEBIT|DR|DEBITED)$/i.test(line)) {
-      currentTx.type = 'DEBIT';
-      currentTx.isCredit = false;
-      continue;
-    }
-    if (/^(CREDIT|CR|CREDITED)$/i.test(line)) {
-      currentTx.type = 'CREDIT';
-      currentTx.isCredit = true;
-      continue;
-    }
-
-    // Amount line (e.g. "₹249" or "20" or "₹160.00")
-    const amtMatch = line.match(/^[-+]?[₹$]?\s*([\d,]+(?:\.\d{1,2})?)$/);
-    if (amtMatch && !currentTx.amount) {
-      if (!/^X{2,}/i.test(line) && !line.includes('UTR') && !/^\d{10,}$/.test(line)) {
-        currentTx.amount = parseFloat(amtMatch[1].replace(/,/g, ''));
-        continue;
+      if (dMatch) {
+        currentDate = dMatch[0];
       }
-    }
-
-    // Metadata lines to skip
-    if (/^(Transaction ID|UTR No\.|Paid by|Credited to|Transfer to Account|Wallet)/i.test(line)) {
       continue;
     }
 
-    // Hint for Credit / Debit based on text
-    if (/^Received from/i.test(line)) {
-      currentTx.isCredit = true;
-    } else if (/^Paid to|^Transfer to/i.test(line)) {
-      currentTx.isCredit = false;
+    // Skip standalone time
+    if (timePattern.test(line)) {
+      continue;
     }
 
-    // Description text (capture the clean name, e.g. "Paid to S K AFGHANI BIRIYANI")
-    if (currentTx.details.length < 2) {
-      currentTx.details.push(line);
-    }
-  }
+    // Match "DEBIT ₹249\tPaid to Nobidul CSE" or "CREDIT ₹120\tReceived from Muntazir Roommate" or "DEBIT ₹500"
+    const typeAmtDescMatch = line.match(/^(DEBIT|CREDIT)\s+[₹$]?\s*([\d,]+(?:\.\d{1,2})?)(?:[\t\s]+(.*?))?$/i);
+    if (typeAmtDescMatch && currentDate) {
+      const type = typeAmtDescMatch[1].toUpperCase();
+      const amountStr = typeAmtDescMatch[2].replace(/,/g, '');
+      let desc = (typeAmtDescMatch[3] || '').trim();
 
-  if (currentTx && currentTx.date && currentTx.amount) {
-    const debitStr = currentTx.type === 'DEBIT' ? String(currentTx.amount) : (currentTx.type === 'CREDIT' ? '' : (currentTx.isCredit ? '' : String(currentTx.amount)));
-    const creditStr = currentTx.type === 'CREDIT' ? String(currentTx.amount) : (currentTx.type === 'DEBIT' ? '' : (currentTx.isCredit ? String(currentTx.amount) : ''));
-    const desc = currentTx.details.join(' ').trim() || 'UPI Transaction';
-    rows.push([currentTx.date, desc, debitStr, creditStr, '']);
+      // If description was on the next line (e.g. for "DEBIT ₹1")
+      if (!desc && i + 1 < lines.length) {
+        const next = lines[i + 1];
+        if (!/^(Transaction ID|UTR No\.|Paid by|Credited to)/i.test(next) && !datePattern.test(next)) {
+          desc = next;
+        }
+      }
+
+      desc = desc.replace(/\s*(?:Transaction ID|UTR No\.|Paid by|Credited to).*$/i, '').trim() || 'PhonePe Transaction';
+
+      const debitStr = type === 'DEBIT' ? amountStr : '';
+      const creditStr = type === 'CREDIT' ? amountStr : '';
+
+      rows.push([currentDate, desc, debitStr, creditStr, '']);
+      continue;
+    }
   }
 
   return rows;
